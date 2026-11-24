@@ -3,6 +3,8 @@
 import argparse
 import json
 import platform
+import math
+import subprocess
 import time
 from pathlib import Path
 
@@ -69,6 +71,51 @@ def scenario(root, size, count, tasks):
     ), robots
 
 
+
+def legacy_config(mission, robots, radius):
+    def position(pose):
+        return {"map_id": pose["frame_id"], "local_xy": pose["pos"][:2]}
+
+    return {
+        "map": {"directory": mission["map_package"], "persistent_cache": False},
+        "robots": [
+            {"id": robot, "start": position(entry["pose"]),
+             "nominal_speed_mps": entry["speed"], "capabilities": entry["capabilities"],
+             "clearance_radius_m": radius, "footprint_radius_m": radius}
+            for robot, entry in sorted(robots.items())
+        ],
+        "tasks": [
+            {"id": task["id"], "location": position(task["location"]),
+             "requirements": task["requirements"], "category": task.get("task_type", "inspection"),
+             "service_seconds": math.ceil(task["service_seconds"]),
+             "high_priority": task.get("high_priority", False)}
+            for task in mission["tasks"]
+        ],
+    }
+
+
+def legacy_result(binary, directory, mission, robots, timeout):
+    directory.mkdir(parents=True, exist_ok=True)
+    config = directory / "input.yaml"
+    config.write_text(yaml.safe_dump(legacy_config(mission, robots, 0.1)))
+    started = time.perf_counter()
+    process = subprocess.run([str(binary), str(config), str(directory)], timeout=timeout,
+                             capture_output=True, text=True, check=False)
+    elapsed = time.perf_counter() - started
+    if process.returncode:
+        return {"success": False, "error": process.stderr.strip(), "cli_wall_seconds": elapsed}
+    data = json.loads((directory / "plan.json").read_text())
+    routes = {route["robot"]: [task for stop in route["stops"] for task in stop["tasks"]]
+              for route in data["routes"]}
+    metrics = {}
+    for line in process.stdout.splitlines():
+        name, _, value = line.strip().partition(": ")
+        if name in {"timing_load_and_parse_seconds", "timing_planning_seconds", "peak_rss_mb",
+                    "maximum_load_seconds", "total_load_seconds"}:
+            metrics[name] = float(value)
+    return {"success": True, "cli_wall_seconds": elapsed, "routes": routes, "metrics": metrics}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -76,11 +123,13 @@ def main():
     parser.add_argument("--robots", type=int, default=5)
     parser.add_argument("--tasks", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=2)
-    parser.add_argument("--timeout", type=float, default=15)
+    parser.add_argument("--timeout", type=float, default=45)
+    parser.add_argument("--legacy-cli", type=lambda value: Path(value).resolve())
     args = parser.parse_args()
     if min(args.sizes) < 32 or min(args.robots, args.tasks, args.repeat) < 1:
         parser.error("sizes >= 32 and positive counts required")
     output = args.output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
     rows = []
     for size in args.sizes:
         mission, robots = scenario(
@@ -97,17 +146,28 @@ def main():
                     time.sleep(0.01)
             finally:
                 worker.close()
-            rows.append(
-                {
-                    "size": size,
-                    "attempt": attempt + 1,
-                    "wall_seconds": time.perf_counter() - started,
-                    "success": result["success"],
-                    "metrics": result.get("metrics", {}),
-                    "error": result.get("error", ""),
-                }
-            )
-            print(json.dumps(rows[-1]), flush=True)
+            row = {
+                "size": size,
+                "attempt": attempt + 1,
+                "wall_seconds": time.perf_counter() - started,
+                "success": result["success"],
+                "metrics": result.get("metrics", {}),
+                "error": result.get("error", ""),
+            }
+            if result["success"]:
+                plan = result["plan"]
+                row["routes"] = {route["robot_id"]: route["task_ids"] for route in plan["routes"]}
+                row["statistics"] = plan["statistics"]
+            if args.legacy_cli:
+                try:
+                    row["legacy"] = legacy_result(args.legacy_cli, output.parent / "legacy" / str(size) /
+                                                  str(attempt + 1), mission, robots, args.timeout)
+                except subprocess.TimeoutExpired:
+                    row["legacy"] = {"success": False, "error": "legacy CLI exceeded timeout"}
+                row["same_task_order"] = ("routes" in row and row["legacy"]["success"]
+                                          and row["routes"] == row["legacy"]["routes"])
+            rows.append(row)
+            print(json.dumps(row), flush=True)
     output.write_text(
         json.dumps(
             {

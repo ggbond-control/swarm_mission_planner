@@ -1,27 +1,35 @@
-# Swarm 规划器测试记录
+# 规划器测试记录
 
-## 2026-11-16
+## 2026-11-24
 
-单元测试在 `test/test_planner.py` 与 `test/test_worker.py`。覆盖地图和起点诊断、能力和操作保留、显式通道、禁止切角、阈值等值、搜索预算、跨图多机保护，以及独立进程超时回收、重复请求与后续请求。跨包计数和 ROS 集成统一记录于 [Swarm TEST_LOG](../swarm_mission_coordinator/TEST_LOG.md)。
+C++ 头文件和实现分别位于 include/swarm_planner、src。删除未实现且无调用的 PlanExporter 和 ExportOptions 声明，显式声明 Boost 编译依赖。Release 构建及八项规划器、工作进程测试通过，最终跨包结果见 [Swarm TEST_LOG](../swarm_mission_coordinator/TEST_LOG.md)。
 
-### 本地合成基准
+| 文件 | 覆盖 |
+| --- | --- |
+| test/test_planner.py | 地图摘要和旋转、非法起点汇总、能力及操作保留、通道端点、多机跨图限制 |
+| test/test_worker.py | 超时回收、失败恢复、重复请求及新请求替换 |
 
-环境：i7-13700K、x86_64、Python 3.12。5 台设备，20 个点，0.1m 分辨率，全白地图，分离能力通道；每条任务只有一台匹配设备，路线互不冲突。每次请求重新 spawn 子进程并读取地图，不复用热缓存。以下 wall 时间包含启动和通信，峰值内存为 Linux 子进程 RSS。
+## 2026-11-23
 
-| 栅格边长 | 两次 wall 时间 | 两次计算时间 | 峰值 RSS（最大值） |
+512×512 合成地图，六台模拟设备，30 点和 100 点各重复 20 次。任务归属和每台顺序均与原 C++ CLI 一致。
+
+| 点数 | 迁移版端到端 P95 | 原 CLI P95 | 峰值 RSS |
 | --- | --- | --- | --- |
-| 128 | 0.236／0.234 秒 | 0.096／0.096 秒 | 54.4 MiB |
-| 256 | 0.547／0.548 秒 | 0.406／0.406 秒 | 58.1 MiB |
-| 512 | 1.845／1.855 秒 | 1.700／1.719 秒 | 70.6 MiB |
+| 30 | 1.063 秒 | 0.991 秒 | 54.4 MiB |
+| 100 | 2.949 秒 | 2.865 秒 | 55.5 MiB |
 
-原始数据：协调器 `runtime/validation/review-20261116/benchmark.json`，日志 `20261116-review-benchmark.log`。这是便于复现的简单基准，不是原 C++ 的对比实验，也不覆盖多候选能力、迷宫、实际大图、重负载或开发板；不能据此承诺 RK3588 实时性能。
+环境为本机 x86_64 Release。工作进程计时包含启动和通信，原 CLI 包含图形导出。资料在协调器 runtime/validation/planner-benchmark-20261123，开发板性能须在实际导航负载下验证。
 
-复现（已 source 新系列 install，在 src 执行；输出选独立数据目录）：
+## 复现
+
+从工作区根目录加载编译环境后执行。
 
 ```bash
-python3 swarm_mission_planner/test/benchmark_planner.py \
-  --output /tmp/swarm-benchmark/result.json \
-  --sizes 128 256 512 --robots 5 --tasks 20 --repeat 2 --timeout 15
+colcon test --packages-select swarm_mission_planner
+python3 src/swarm_mission_planner/test/benchmark_planner.py \
+  --output /tmp/swarm-benchmark/result.json --sizes 512 \
+  --robots 6 --tasks 100 --repeat 20 \
+  --legacy-cli build/capability_mission_planner/capability_mission_planner_cli
 ```
 
-目标板验收建议：代表性真实地图与典型／上限点数，至少统计耗时分位数、最慢值、峰值内存、失败率、路线质量及导航 CPU 负载；先补齐功能差异，再判断 Python 或独立 C++ 核心的取舍。未经这一步，不将当前新规划器标为旧版生产替代。
+历史 Python 原型的指标保存在协调器 runtime/archives/test-log-before-review-20261124.md，对当前 C++ 实现的验收使用上述测试。

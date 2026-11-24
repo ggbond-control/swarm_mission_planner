@@ -1,25 +1,24 @@
 """One disposable planner process; no ROS or control interfaces in the child."""
 
 import multiprocessing
-import resource
+import os
+import signal
 import time
 
 from swarm_protocol.contracts import MAX_MESSAGE_BYTES, canonical, decode, finite
 
-from .planner import plan
+from .planner import calculate
 
 
 def _calculate(connection, mission, robots, options):
-    started = time.perf_counter()
+    # The native executable inherits this private process group.
+    os.setsid()
     try:
         try:
-            result = {"success": True, "plan": plan(mission, robots, **options)}
+            result = calculate(mission["map_package"], mission=mission, robots=robots,
+                               **options)
         except Exception as error:
             result = {"success": False, "error": str(error)}
-        result["metrics"] = {
-            "compute_seconds": time.perf_counter() - started,
-            "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-        }
         raw = canonical(result).encode()
         if len(raw) > MAX_MESSAGE_BYTES:
             raw = canonical(
@@ -47,6 +46,7 @@ class PlanningWorker:
         self.connection = None
         self.request_id = None
         self.deadline = 0.0
+        self.started = 0.0
 
     @property
     def busy(self):
@@ -59,7 +59,9 @@ class PlanningWorker:
         process = self.context.Process(
             target=_calculate, args=(child, mission, robots, options), daemon=True
         )
-        self.deadline = time.monotonic() + self.timeout
+        options.setdefault("timeout", self.timeout)
+        self.started = time.monotonic()
+        self.deadline = self.started + self.timeout
         try:
             process.start()
         except Exception:
@@ -92,6 +94,7 @@ class PlanningWorker:
         if result is None:
             return None
         request_id = self.request_id
+        result.setdefault("metrics", {})["wall_seconds"] = time.monotonic() - self.started
         self.close()
         return {"request_id": request_id, **result}
 
@@ -100,10 +103,10 @@ class PlanningWorker:
             return
         self.process.join(timeout=0.01)
         if self.process.is_alive():
-            self.process.terminate()
+            self._signal(signal.SIGTERM)
             self.process.join(timeout=0.1)
         if self.process.is_alive():
-            self.process.kill()
+            self._signal(signal.SIGKILL)
             self.process.join(timeout=0.1)
         if self.process.is_alive():
             raise RuntimeError(
@@ -112,3 +115,14 @@ class PlanningWorker:
         self.process.close()
         self.connection.close()
         self.process = self.connection = self.request_id = None
+
+    def _signal(self, sig):
+        pid = self.process.pid
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            # The worker may still be starting and have no process group yet.
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
